@@ -1,0 +1,190 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ============================================================
+# pitr — point-in-time restore for a PostgreSQL app cluster
+# Version: 1.0.2 (final)
+# ============================================================
+
+# ---------- CONFIG ----------
+PG_VERSION="16"
+BASE_DIR="/var/lib/postgresql/${PG_VERSION}"
+
+# ---------- HELP ----------
+show_help() {
+cat <<EOF
+pitr — point-in-time restore (PITR) for a PostgreSQL app cluster
+
+REQUIREMENTS:
+  - Ubuntu / Debian-based Linux
+  - PostgreSQL installed via apt
+  - Cluster created via initcluster
+  - pgBackRest installed and configured
+  - At least one full backup exists
+  - sudo access
+
+USAGE:
+  sudo pitr -a <app_name> -t "<YYYY-MM-DD HH:MM:SS+TZ>"
+
+OPTIONS:
+  -a <app_name>   Application / cluster name
+                  (cluster = data dir = stanza)
+  -t <timestamp>  Target restore time (PostgreSQL timestamp format)
+  -h, --help      Show this help and exit
+
+EXAMPLE:
+  sudo pitr -a app1 -t "2026-01-18 14:59:10+00"
+
+WHAT THIS DOES:
+  - Stops the app's PostgreSQL cluster
+  - Preserves current data directory as:
+      old-<app>-<timestamp>
+  - Restores data from pgBackRest to target time
+  - Starts and PROMOTES the cluster to primary
+
+WARNING:
+  This operation is DESTRUCTIVE to current data.
+  Old data is preserved automatically for rollback.
+
+MENTAL MODEL:
+  PITR rewinds the entire cluster (one app = one cluster).
+
+EOF
+exit 0
+}
+
+# ---------- HELP FLAG ----------
+for arg in "$@"; do
+  case "$arg" in
+    -h|--help) show_help ;;
+  esac
+done
+
+# ---------- USAGE ----------
+usage() {
+  echo "Usage: sudo pitr -a <app_name> -t \"YYYY-MM-DD HH:MM:SS+TZ\""
+  echo "Try:   sudo pitr --help"
+  exit 1
+}
+
+# ---------- PARSE FLAGS ----------
+while getopts ":a:t:" opt; do
+  case ${opt} in
+    a ) APP_NAME="$OPTARG" ;;
+    t ) TARGET_TIME="$OPTARG" ;;
+    * ) usage ;;
+  esac
+done
+
+[ -z "${APP_NAME:-}" ] && usage
+[ -z "${TARGET_TIME:-}" ] && usage
+
+STANZA="$APP_NAME"
+PGDATA="${BASE_DIR}/${APP_NAME}"
+SERVICE="postgresql@${PG_VERSION}-${APP_NAME}"
+
+# Resolve port dynamically (authoritative)
+PORT="$(pg_lsclusters | awk -v c="$APP_NAME" '$2==c {print $3}')"
+[ -z "$PORT" ] && {
+  echo "❌ Could not determine port for cluster '$APP_NAME'"
+  exit 1
+}
+
+TS_CLEAN="$(date -d "$TARGET_TIME" +%Y%m%dT%H%M%S 2>/dev/null || true)"
+[ -z "$TS_CLEAN" ] && {
+  echo "❌ Invalid timestamp format."
+  exit 1
+}
+
+OLD_DIR="${BASE_DIR}/old-${APP_NAME}-${TS_CLEAN}"
+
+# ---------- PRECHECKS ----------
+echo
+echo "🔍 Pre-flight checks..."
+echo "---------------------"
+
+if [ ! -d "$PGDATA" ]; then
+  echo "❌ Cluster data directory not found: $PGDATA"
+  exit 1
+fi
+
+if ! pg_lsclusters | awk '{print $2}' | grep -qx "$APP_NAME"; then
+  echo "❌ PostgreSQL cluster '$APP_NAME' does not exist."
+  exit 1
+fi
+
+# Block if ANY cluster is already in recovery
+if pg_lsclusters | grep -q recovery; then
+  echo "❌ Another cluster is currently in recovery."
+  echo "   Promote it before running PITR."
+  exit 1
+fi
+
+if ! sudo -u postgres pgbackrest info --stanza="$STANZA" >/dev/null 2>&1; then
+  echo "❌ pgBackRest stanza '$STANZA' not found."
+  exit 1
+fi
+
+if ! sudo -u postgres pgbackrest info --stanza="$STANZA" | grep -q "full backup"; then
+  echo "❌ No valid backups found for stanza '$STANZA'."
+  exit 1
+fi
+
+# ---------- CONFIRM ----------
+echo
+echo "⚠️  POINT-IN-TIME RESTORE CONFIRMATION"
+echo "------------------------------------"
+echo "App / Cluster : $APP_NAME"
+echo "Port          : $PORT"
+echo "Target time  : $TARGET_TIME"
+echo "Service      : $SERVICE"
+echo "Active data  : $PGDATA"
+echo "Old data →   : $OLD_DIR"
+echo
+read -rp "Type 'YES' to proceed: " CONFIRM
+
+[ "$CONFIRM" != "YES" ] && {
+  echo "❌ Aborted by user."
+  exit 1
+}
+
+# ---------- EXECUTE ----------
+echo
+echo "🛑 Stopping PostgreSQL cluster..."
+systemctl stop "$SERVICE"
+
+echo "📦 Preserving current data..."
+mv "$PGDATA" "$OLD_DIR"
+
+echo "⏪ Restoring cluster to target time..."
+sudo -u postgres pgbackrest \
+  --stanza="$STANZA" \
+  --type=time \
+  --target="$TARGET_TIME" \
+  restore
+
+echo "🚀 Starting PostgreSQL cluster..."
+systemctl start "$SERVICE"
+
+echo "🔓 Promoting cluster to primary..."
+sudo -u postgres psql -p "$PORT" -c "SELECT pg_promote();"
+
+# ---------- VERIFY ----------
+echo "🔍 Verifying recovery state..."
+RECOVERY_STATE="$(sudo -u postgres psql -p "$PORT" -Atc "SELECT pg_is_in_recovery();")"
+
+if [ "$RECOVERY_STATE" != "f" ]; then
+  echo "❌ Cluster is still in recovery — promotion failed."
+  exit 1
+fi
+
+# ---------- DONE ----------
+echo
+echo "✅ PITR COMPLETE — CLUSTER PROMOTED"
+echo "----------------------------------"
+echo "Active data : $PGDATA"
+echo "Old data    : $OLD_DIR"
+echo
+echo "👉 Verify data, then delete old directory when safe:"
+echo "sudo rm -rf $OLD_DIR"
+echo

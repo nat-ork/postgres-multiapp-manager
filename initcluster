@@ -1,0 +1,169 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ============================================================
+# initcluster — initialize a PostgreSQL app cluster with PITR
+# Version: 1.0.2 (final)
+# ============================================================
+
+PG_VERSION="16"
+PG_BASE="/var/lib/postgresql/${PG_VERSION}"
+PGBR_CONF="/etc/pgbackrest/pgbackrest.conf"
+PGBR_REPO="/var/lib/pgbackrest"
+
+# ---------------- HELP ----------------
+show_help() {
+cat <<EOF
+initcluster — initialize a PostgreSQL app cluster with PITR enabled
+
+REQUIREMENTS:
+  - Ubuntu / Debian-based Linux
+  - PostgreSQL installed via apt
+  - pgBackRest installed
+  - systemd
+  - sudo access
+
+USAGE:
+  sudo initcluster -a <app_name> -p <port>
+
+OPTIONS:
+  -a <app_name>   Application name
+                  (cluster = data dir = stanza)
+  -p <port>       PostgreSQL port for this cluster
+  -h, --help      Show this help and exit
+
+EXAMPLE:
+  sudo initcluster -a app1 -p 5432
+  sudo initcluster -a app2 -p 5433
+
+DESIGN:
+  One app = One PostgreSQL cluster = One PITR universe
+
+EOF
+exit 0
+}
+
+# ---------------- HELP FLAG ----------------
+for arg in "$@"; do
+  case "$arg" in
+    -h|--help) show_help ;;
+  esac
+done
+
+# ---------------- ARG PARSING ----------------
+usage() {
+  echo "Usage: sudo initcluster -a <app_name> -p <port>"
+  echo "Try:   sudo initcluster --help"
+  exit 1
+}
+
+while getopts ":a:p:" opt; do
+  case ${opt} in
+    a ) APP="$OPTARG" ;;
+    p ) PORT="$OPTARG" ;;
+    * ) usage ;;
+  esac
+done
+
+[ -z "${APP:-}" ] && usage
+[ -z "${PORT:-}" ] && usage
+
+CLUSTER="$APP"
+STANZA="$APP"
+DATA_DIR="${PG_BASE}/${APP}"
+SERVICE="postgresql@${PG_VERSION}-${APP}"
+CONF="/etc/postgresql/${PG_VERSION}/${CLUSTER}/postgresql.conf"
+
+echo
+echo "🚀 Initializing PostgreSQL cluster"
+echo "---------------------------------"
+echo "App / Cluster : $APP"
+echo "Port          : $PORT"
+echo "Data dir      : $DATA_DIR"
+echo "Service       : $SERVICE"
+echo "Stanza        : $STANZA"
+echo
+
+# ---------------- SAFETY CHECKS ----------------
+
+# Existing cluster
+if pg_lsclusters | awk '{print $2}' | grep -qx "$APP"; then
+  echo "❌ Cluster '$APP' already exists."
+  exit 1
+fi
+
+# Port in use
+if ss -lnt | awk '{print $4}' | grep -q ":$PORT$"; then
+  echo "❌ Port $PORT is already in use."
+  exit 1
+fi
+
+# Any cluster stuck in recovery (pgBackRest safety)
+if pg_lsclusters | grep -q recovery; then
+  echo "❌ Another cluster is in recovery mode."
+  echo "   Promote it before creating a new cluster."
+  exit 1
+fi
+
+# ---------------- BASE DIRECTORIES ----------------
+sudo mkdir -p /etc/pgbackrest "$PGBR_REPO"
+sudo chown postgres:postgres /etc/pgbackrest "$PGBR_REPO"
+sudo chmod 750 /etc/pgbackrest "$PGBR_REPO"
+
+# ---------------- CREATE CLUSTER ----------------
+echo "🛠 Creating PostgreSQL cluster..."
+sudo pg_createcluster "$PG_VERSION" "$CLUSTER" --port "$PORT"
+
+# ---------------- WAL ARCHIVING (NO restore_command YET) ----------------
+echo "📝 Configuring WAL archiving..."
+sudo sed -i "/^#\?archive_mode/d" "$CONF"
+sudo sed -i "/^#\?archive_command/d" "$CONF"
+sudo sed -i "/^#\?restore_command/d" "$CONF"
+
+echo "archive_mode = on" \
+  | sudo tee -a "$CONF" >/dev/null
+
+echo "archive_command = 'pgbackrest --stanza=${STANZA} archive-push %p'" \
+  | sudo tee -a "$CONF" >/dev/null
+
+# ---------------- START CLUSTER ----------------
+echo "🔄 Starting cluster..."
+sudo systemctl start "$SERVICE"
+
+# ---------------- REGISTER STANZA ----------------
+if ! grep -q "^\[$STANZA\]" "$PGBR_CONF" 2>/dev/null; then
+  echo "📦 Registering pgBackRest stanza..."
+  sudo tee -a "$PGBR_CONF" >/dev/null <<EOF
+
+[$STANZA]
+pg1-path=${DATA_DIR}
+pg1-port=${PORT}
+EOF
+fi
+
+# ---------------- CREATE STANZA ----------------
+echo "📂 Creating pgBackRest stanza..."
+sudo -u postgres pgbackrest --stanza="$STANZA" stanza-create
+
+# ---------------- FIRST FULL BACKUP ----------------
+echo "💾 Taking first full backup..."
+sudo -u postgres pgbackrest --stanza="$STANZA" backup --type=full
+
+# ---------------- ENABLE restore_command (FINAL STEP) ----------------
+echo "🧩 Enabling restore_command..."
+echo "restore_command = 'pgbackrest --stanza=${STANZA} archive-get %f %p'" \
+  | sudo tee -a "$CONF" >/dev/null
+
+echo "🔄 Restarting cluster (final)..."
+sudo systemctl restart "$SERVICE"
+
+# ---------------- DONE ----------------
+echo
+echo "✅ Cluster '$APP' initialized successfully"
+echo "-----------------------------------------"
+echo "Port        : $PORT"
+echo "Data dir    : $DATA_DIR"
+echo "Service     : $SERVICE"
+echo "Backups     : READY"
+echo "PITR        : READY"
+echo
