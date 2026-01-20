@@ -5,7 +5,7 @@
 </p>
 
 <p align="center">
-  <strong>Isolated clusters · Mandatory backups · Safe PITR</strong>
+  <strong>Isolated clusters · Mandatory backups · Safe PITR · Safe Branching</strong>
 </p>
 
 <p align="center">
@@ -18,15 +18,18 @@
 
 **postgres-multiapp-manager** provides a small set of opinionated CLI tools  
 to safely run **multiple isolated PostgreSQL applications** on a single  
-Ubuntu server.
+Ubuntu / Debian server.
 
 Each app gets its own:
-- PostgreSQL cluster
-- backup timeline
-- recovery history
+
+- PostgreSQL cluster  
+- backup timeline  
+- recovery history  
+- optional child branches (for staging / testing)
 
 Failures stay isolated.  
-Restores are predictable.
+Restores are predictable.  
+Branching is safe and explicit.
 
 ---
 
@@ -44,9 +47,10 @@ Most self-hosted setups start like this:
 That works… **until it doesn’t**.
 
 When something goes wrong:
-- backups are incomplete
-- restores are risky
-- rollback becomes guesswork
+
+- backups are incomplete  
+- restores are risky  
+- rollback becomes guesswork  
 
 This project enforces a stricter, production-safe model instead.
 
@@ -62,9 +66,9 @@ Each application runs in a fully isolated cluster with:
 - its own port  
 - its own WAL stream  
 - its own pgBackRest stanza  
-- independent backups and restores  
+- independent backups, restores, and branches  
 
-This makes **failure isolation, backups, and recovery predictable**.
+This makes **failure isolation, backups, recovery, and branching predictable**.
 
 ---
 
@@ -76,6 +80,7 @@ Each application runs in its **own PostgreSQL cluster**,
 not just its own database.
 
 Why this matters:
+
 - PITR works at the **cluster level**
 - Restores never affect other apps
 - No cross-app blast radius
@@ -102,11 +107,27 @@ Point-in-Time Restore always:
 - stops the cluster  
 - preserves current data  
 - restores to an exact timestamp  
-- promotes the cluster  
+- promotes only if required  
 - leaves old data intact for rollback  
 
 No silent data loss.  
 No half-restored clusters.
+
+---
+
+### 4️⃣ Branching Is Explicit & Isolated
+
+Branches are **full PostgreSQL clusters**, not replicas.
+
+- One-way derived from a parent cluster
+- Parent is never modified
+- Each branch has:
+  - its own data directory
+  - its own port
+  - its own pgBackRest stanza
+  - its own PITR timeline
+
+Branching is **safe, destructive only to the branch, and reversible**.
 
 ---
 
@@ -116,7 +137,8 @@ No half-restored clusters.
 
 Creates a **production-ready PostgreSQL cluster** for one app.
 
-It guarantees:
+Guarantees:
+
 - consistent naming
 - correct WAL configuration
 - pgBackRest stanza creation
@@ -129,12 +151,35 @@ It guarantees:
 
 Performs a **safe Point-in-Time Restore** for one app cluster.
 
-It guarantees:
+Guarantees:
+
 - correct cluster selection
 - correct port targeting
-- restore + promotion
-- no cluster left in recovery
+- restore to an exact timestamp
+- promotion only when required
+- recovery state verification
 - old data preserved automatically
+
+---
+
+### `pgbranch`
+
+Manages **safe PostgreSQL cluster branching**.
+
+#### Branch creation
+- interactive parent selection
+- automatic child naming (`app_dev`)
+- new isolated cluster creation
+- restore from parent via pgBackRest
+- new stanza + first backup
+- branch always ends writable
+
+#### Branch sync
+- one-way sync: **parent → branch**
+- parent is never touched
+- branch data preserved before sync
+- restore from parent
+- success explicitly verified
 
 ---
 
@@ -142,7 +187,8 @@ It guarantees:
 
 This project is intentionally opinionated.
 
-Supported environment:
+### Supported environment
+
 - Ubuntu / Debian-based Linux
 - PostgreSQL installed via `apt`
 - `pg_createcluster` available
@@ -150,68 +196,75 @@ Supported environment:
 - `systemd`
 - `sudo` access
 
-Not designed for:
-- Docker-only workflows
-- RHEL or non-Debian distros
-- Managed cloud PostgreSQL
+### Not designed for
+
+- Docker-only workflows  
+- RHEL or non-Debian distros  
+- Managed cloud PostgreSQL  
+- Multi-tenant shared DB designs  
 
 ---
 
 ## ⚙️ Installation
 
-Clone the repository:
+### 1️⃣ Clone the repository
+
 ```bash
 git clone https://github.com/nat-ork/postgres-multiapp-manager
 cd postgres-multiapp-manager
 
 
+2️⃣ Install the CLI tools
 
 Copy scripts into your PATH:
 
 sudo cp initcluster /usr/local/bin/initcluster
-sudo cp pitr /usr/local/bin/pitr
+sudo cp pitr        /usr/local/bin/pitr
+sudo cp pgbranch    /usr/local/bin/pgbranch
 
 
 Make them executable:
 
 sudo chmod +x /usr/local/bin/initcluster
 sudo chmod +x /usr/local/bin/pitr
+sudo chmod +x /usr/local/bin/pgbranch
 
-
-Verify:
-
+3️⃣ Verify installation
 initcluster --help
 pitr --help
+pgbranch --help
 
 ▶️ Usage
 Create a new app cluster
 sudo initcluster -a app1 -p 5432
 
 
-This will:
+What this does:
 
-create a PostgreSQL cluster named app1
+creates a PostgreSQL cluster named app1
 
-bind it to port 5432
+binds it to port 5432
 
-enable WAL archiving
+enables WAL archiving
 
-register a pgBackRest stanza
+registers a pgBackRest stanza
 
-take the first full backup
+takes the first full backup
 
-make the cluster PITR-ready
+makes the cluster PITR-ready
 
-Create another app on the same server
+Create another app on the same server:
+
 sudo initcluster -a app2 -p 5433
 
 
 Each app is fully isolated.
 
-⏪ Performing a Point-in-Time Restore (PITR)
-Example scenario
+⏪ Perform a Point-in-Time Restore (PITR)
 
-Data deleted at 2026-01-19 10:45 UTC
+Scenario
+
+Data deleted at: 2026-01-19 10:45 UTC
 
 Restore target: 2026-01-19 10:40 UTC
 
@@ -222,33 +275,49 @@ sudo pitr -a app1 -t "2026-01-19 10:40:00+00"
 
 What happens:
 
-clear confirmation prompt
+confirmation prompt
 
-cluster is stopped
+cluster stopped
 
-current data directory renamed to old-app1-<timestamp>
+current data preserved as old-app1-<timestamp>
 
 restore from pgBackRest
 
-cluster started and promoted
+cluster started
 
 recovery state verified
 
-🛡 Safety Guarantees
+🌱 Create a branch (staging / dev)
+sudo pgbranch -c
 
-These tools explicitly prevent:
 
-restoring the wrong cluster
+Flow:
 
-mixing clusters on the same port
+select parent cluster interactively
 
-running PITR while another cluster is in recovery
+enter branch name (e.g. dev)
 
-silent data loss
+branch created as app1_dev
 
-half-restored clusters
+new isolated cluster is created
 
-If something is unsafe, the command fails loudly.
+branch has its own backups and PITR
+
+🔄 Sync a branch with its parent
+sudo pgbranch -b app1_dev sync
+
+
+What happens:
+
+branch is stopped
+
+old branch data preserved
+
+parent data restored into branch
+
+branch started and verified writable
+
+parent is never modified
 
 🧹 Removing a Cluster
 
@@ -265,13 +334,33 @@ configuration
 
 systemd service
 
+pgBackRest backups are not deleted.
+
 ⚠️ Do not delete directories manually.
+
+🛡 Safety Guarantees
+
+These tools explicitly prevent:
+
+restoring the wrong cluster
+
+mixing clusters on the same port
+
+running PITR while another cluster is in recovery
+
+syncing data in the wrong direction
+
+silent data loss
+
+half-restored clusters
+
+If something is unsafe, the command fails loudly.
 
 ⚖️ Known Design Decisions (Intentional)
 
 PITR is cluster-wide, not database-specific
 
-PostgreSQL version is hard-coded in scripts
+PostgreSQL version is hard-coded
 
 pgBackRest is required
 
@@ -306,8 +395,10 @@ Multi-tenant shared DB designs
 Anyone wanting “magic” without understanding Postgres
 
 🧠 Final Mental Model
+initcluster → creates a universe
+pgbranch    → forks or syncs universes
+pitr        → rewinds a universe
+pg_dropcluster → destroys a universe
 
-initcluster creates a universe
-pitr rewinds that universe
 
 Each app lives — and fails — independently.
