@@ -58,6 +58,10 @@ require_no_recovery() {
   fi
 }
 
+cluster_exists() {
+  pg_lsclusters | awk '{print $2}' | grep -qx "$1"
+}
+
 get_clusters() {
   pg_lsclusters | awk 'NR>1 {print $2}'
 }
@@ -75,6 +79,7 @@ next_free_port() {
 ensure_primary() {
   local port="$1"
   local state
+
   state="$(sudo -u postgres psql -p "$port" -Atc "SELECT pg_is_in_recovery();")"
 
   if [ "$state" = "t" ]; then
@@ -85,6 +90,13 @@ ensure_primary() {
   fi
 
   [ "$state" = "f" ] || fail "Cluster is still in recovery after restore."
+}
+
+ensure_parent_backup() {
+  local parent="$1"
+
+  echo "💾 Ensuring fresh backup of parent '$parent'..."
+  sudo -u postgres pgbackrest --stanza="$parent" backup
 }
 
 # ============================================================
@@ -102,6 +114,8 @@ if [ "$MODE" = "create" ]; then
     [ -n "$PARENT" ] && break
   done
 
+  cluster_exists "$PARENT" || fail "Parent cluster '$PARENT' not found"
+
   read -rp "Enter branch name (e.g. dev): " SUFFIX
   [ -z "$SUFFIX" ] && fail "Branch name required"
 
@@ -111,7 +125,7 @@ if [ "$MODE" = "create" ]; then
   CONF="${CONF_DIR}/postgresql.conf"
   SERVICE="postgresql@${PG_VERSION}-${BRANCH}"
 
-  pg_lsclusters | awk '{print $2}' | grep -qx "$BRANCH" && fail "Branch already exists"
+  cluster_exists "$BRANCH" && fail "Branch '$BRANCH' already exists"
 
   PORT="$(next_free_port)"
 
@@ -125,6 +139,9 @@ if [ "$MODE" = "create" ]; then
 
   confirm_y
 
+  # 🔑 CRITICAL FIX
+  ensure_parent_backup "$PARENT"
+
   echo "🛠 Creating PostgreSQL cluster shell..."
   sudo pg_createcluster "$PG_VERSION" "$BRANCH" --port "$PORT"
 
@@ -133,7 +150,7 @@ if [ "$MODE" = "create" ]; then
   echo "🧹 Preparing empty data directory..."
   sudo rm -rf "${DATA_DIR:?}/"*
 
-  echo "📦 Restoring from parent..."
+  echo "📦 Restoring from parent backup..."
   sudo -u postgres pgbackrest \
     --stanza="$PARENT" \
     restore \
@@ -184,6 +201,9 @@ if [ "$ACTION" = "sync" ]; then
   PARENT="${BRANCH%%_*}"
   [ "$PARENT" = "$BRANCH" ] && fail "Invalid branch name"
 
+  cluster_exists "$PARENT" || fail "Parent cluster '$PARENT' not found"
+  cluster_exists "$BRANCH" || fail "Branch '$BRANCH' not found"
+
   require_no_recovery
 
   PORT="$(pg_lsclusters | awk -v c="$BRANCH" '$2==c {print $3}')"
@@ -200,10 +220,13 @@ if [ "$ACTION" = "sync" ]; then
 
   confirm_y
 
+  # 🔑 CRITICAL FIX
+  ensure_parent_backup "$PARENT"
+
   sudo systemctl stop "$SERVICE"
   sudo mv "$PGDATA" "$OLD_DIR"
 
-  echo "📦 Restoring from parent..."
+  echo "📦 Restoring from parent backup..."
   sudo -u postgres pgbackrest \
     --stanza="$PARENT" \
     restore \
