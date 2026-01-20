@@ -1,0 +1,227 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ============================================================
+# pgbranch — safe PostgreSQL cluster branching
+# ============================================================
+
+PG_VERSION="16"
+BASE_DIR="/var/lib/postgresql/${PG_VERSION}"
+PGBR_CONF="/etc/pgbackrest/pgbackrest.conf"
+
+# ---------------- HELP ----------------
+show_help() {
+cat <<EOF
+pgbranch — safe PostgreSQL cluster branching
+
+USAGE:
+  pgbranch -c
+    Create a new branch interactively
+
+  pgbranch -b <branch_name> sync
+    Sync branch from parent (parent → branch)
+
+EOF
+exit 0
+}
+
+# ---------------- FLAGS ----------------
+MODE=""
+BRANCH=""
+
+while getopts ":cb:h" opt; do
+  case ${opt} in
+    c ) MODE="create" ;;
+    b ) BRANCH="$OPTARG" ;;
+    h ) show_help ;;
+    * ) show_help ;;
+  esac
+done
+
+shift $((OPTIND -1))
+ACTION="${1:-}"
+
+# ---------------- HELPERS ----------------
+fail() {
+  echo "❌ $1"
+  exit 1
+}
+
+confirm_y() {
+  read -rp "Proceed? [y/N]: " CONFIRM
+  [[ "$CONFIRM" == "y" || "$CONFIRM" == "Y" ]] || fail "Aborted."
+}
+
+require_no_recovery() {
+  if pg_lsclusters | grep -q recovery; then
+    fail "A cluster is in recovery. Promote it first."
+  fi
+}
+
+get_clusters() {
+  pg_lsclusters | awk 'NR>1 {print $2}'
+}
+
+next_free_port() {
+  for p in $(seq 5432 5499); do
+    if ! ss -lnt | awk '{print $4}' | grep -q ":$p$"; then
+      echo "$p"
+      return
+    fi
+  done
+  fail "No free ports available"
+}
+
+ensure_primary() {
+  local port="$1"
+  local state
+  state="$(sudo -u postgres psql -p "$port" -Atc "SELECT pg_is_in_recovery();")"
+
+  if [ "$state" = "t" ]; then
+    echo "🔓 Promoting cluster..."
+    sudo -u postgres psql -p "$port" -c "SELECT pg_promote();"
+    sleep 1
+    state="$(sudo -u postgres psql -p "$port" -Atc "SELECT pg_is_in_recovery();")"
+  fi
+
+  [ "$state" = "f" ] || fail "Cluster is still in recovery after restore."
+}
+
+# ============================================================
+# CREATE BRANCH
+# ============================================================
+if [ "$MODE" = "create" ]; then
+  require_no_recovery
+
+  CLUSTERS=($(get_clusters))
+  [ "${#CLUSTERS[@]}" -eq 0 ] && fail "No clusters available"
+
+  echo
+  echo "Select parent cluster:"
+  select PARENT in "${CLUSTERS[@]}"; do
+    [ -n "$PARENT" ] && break
+  done
+
+  read -rp "Enter branch name (e.g. dev): " SUFFIX
+  [ -z "$SUFFIX" ] && fail "Branch name required"
+
+  BRANCH="${PARENT}_${SUFFIX}"
+  DATA_DIR="${BASE_DIR}/${BRANCH}"
+  CONF_DIR="/etc/postgresql/${PG_VERSION}/${BRANCH}"
+  CONF="${CONF_DIR}/postgresql.conf"
+  SERVICE="postgresql@${PG_VERSION}-${BRANCH}"
+
+  pg_lsclusters | awk '{print $2}' | grep -qx "$BRANCH" && fail "Branch already exists"
+
+  PORT="$(next_free_port)"
+
+  echo
+  echo "🚀 Creating branch"
+  echo "-----------------"
+  echo "Parent : $PARENT"
+  echo "Branch : $BRANCH"
+  echo "Port   : $PORT"
+  echo
+
+  confirm_y
+
+  echo "🛠 Creating PostgreSQL cluster shell..."
+  sudo pg_createcluster "$PG_VERSION" "$BRANCH" --port "$PORT"
+
+  sudo systemctl stop "$SERVICE"
+
+  echo "🧹 Preparing empty data directory..."
+  sudo rm -rf "${DATA_DIR:?}/"*
+
+  echo "📦 Restoring from parent..."
+  sudo -u postgres pgbackrest \
+    --stanza="$PARENT" \
+    restore \
+    --pg1-path="$DATA_DIR"
+
+  sudo sed -i "/^#\?archive_mode/d" "$CONF"
+  sudo sed -i "/^#\?archive_command/d" "$CONF"
+  sudo sed -i "/^#\?restore_command/d" "$CONF"
+
+  echo "archive_mode = on" | sudo tee -a "$CONF" >/dev/null
+  echo "archive_command = 'pgbackrest --stanza=${BRANCH} archive-push %p'" \
+    | sudo tee -a "$CONF" >/dev/null
+  echo "restore_command = 'pgbackrest --stanza=${BRANCH} archive-get %f %p'" \
+    | sudo tee -a "$CONF" >/dev/null
+
+  if ! grep -q "^\[$BRANCH\]" "$PGBR_CONF" 2>/dev/null; then
+    sudo tee -a "$PGBR_CONF" >/dev/null <<EOF
+
+[$BRANCH]
+pg1-path=$DATA_DIR
+pg1-port=$PORT
+EOF
+  fi
+
+  sudo systemctl start "$SERVICE"
+  ensure_primary "$PORT"
+
+  sudo -u postgres pgbackrest --stanza="$BRANCH" stanza-create
+  sudo -u postgres pgbackrest --stanza="$BRANCH" backup --type=full
+
+  echo
+  echo "✅ Branch created successfully"
+  echo "--------------------------------"
+  echo "Parent : $PARENT"
+  echo "Branch : $BRANCH"
+  echo "Port   : $PORT"
+  echo "State  : primary (writable)"
+  echo
+  exit 0
+fi
+
+# ============================================================
+# SYNC BRANCH
+# ============================================================
+if [ "$ACTION" = "sync" ]; then
+  [ -z "$BRANCH" ] && fail "Branch name required (-b)"
+
+  PARENT="${BRANCH%%_*}"
+  [ "$PARENT" = "$BRANCH" ] && fail "Invalid branch name"
+
+  require_no_recovery
+
+  PORT="$(pg_lsclusters | awk -v c="$BRANCH" '$2==c {print $3}')"
+  SERVICE="postgresql@${PG_VERSION}-${BRANCH}"
+  PGDATA="${BASE_DIR}/${BRANCH}"
+  TS="$(date +%Y%m%dT%H%M%S)"
+  OLD_DIR="${BASE_DIR}/old-${BRANCH}-sync-${TS}"
+
+  echo
+  echo "⚠️  SYNC BRANCH"
+  echo "Source : $PARENT"
+  echo "Target : $BRANCH"
+  echo
+
+  confirm_y
+
+  sudo systemctl stop "$SERVICE"
+  sudo mv "$PGDATA" "$OLD_DIR"
+
+  echo "📦 Restoring from parent..."
+  sudo -u postgres pgbackrest \
+    --stanza="$PARENT" \
+    restore \
+    --pg1-path="$PGDATA"
+
+  sudo systemctl start "$SERVICE"
+  ensure_primary "$PORT"
+
+  echo
+  echo "✅ Sync completed successfully"
+  echo "--------------------------------"
+  echo "Source : $PARENT"
+  echo "Branch : $BRANCH"
+  echo "State  : primary (writable)"
+  echo "Old data preserved at:"
+  echo "$OLD_DIR"
+  echo
+  exit 0
+fi
+
+show_help
