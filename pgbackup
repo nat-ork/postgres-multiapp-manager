@@ -1,0 +1,129 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ============================================================
+# pgbackup — safe PostgreSQL backup & optional export
+# ============================================================
+
+EXPORT_PATH=""
+PGBR_CONF="/etc/pgbackrest/pgbackrest.conf"
+
+# ---------------- HELP ----------------
+show_help() {
+cat <<EOF
+pgbackup — manual PostgreSQL backup helper
+
+USAGE:
+  pgbackup
+    Take a fresh pgBackRest backup for all ACTIVE clusters
+
+  pgbackup -path <directory>
+    Take a fresh backup, then export pgBackRest repo to directory
+EOF
+exit 0
+}
+
+# ---------------- FLAGS ----------------
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -path)
+      EXPORT_PATH="${2:-}"
+      shift 2
+      ;;
+    -h|--help)
+      show_help
+      ;;
+    *)
+      echo "❌ Unknown option: $1"
+      show_help
+      ;;
+  esac
+done
+
+# ---------------- HELPERS ----------------
+fail() {
+  echo "❌ $1"
+  exit 1
+}
+
+require_pgbackrest() {
+  command -v pgbackrest >/dev/null || fail "pgBackRest not installed"
+  [ -f "$PGBR_CONF" ] || fail "pgBackRest config not found at $PGBR_CONF"
+}
+
+get_repo_path() {
+  grep '^repo1-path=' "$PGBR_CONF" \
+    | head -n1 \
+    | cut -d'=' -f2
+}
+
+get_active_clusters() {
+  pg_lsclusters | awk 'NR>1 && $4=="online" {print $2}'
+}
+
+validate_export_path() {
+  local path="$1"
+
+  [ "$path" != "/" ] || fail "Refusing to use / as export path"
+
+  if [ ! -d "$path" ]; then
+    echo "📁 Creating export directory: $path"
+    mkdir -p "$path" || fail "Failed to create export directory"
+  fi
+
+  [ -w "$path" ] || fail "Export path not writable: $path"
+}
+
+# ---------------- MAIN ----------------
+require_pgbackrest
+
+REPO_PATH="$(get_repo_path)"
+[ -n "$REPO_PATH" ] || fail "repo1-path not defined in pgbackrest.conf"
+[ -d "$REPO_PATH" ] || fail "pgBackRest repo directory not found: $REPO_PATH"
+
+CLUSTERS=($(get_active_clusters))
+[ "${#CLUSTERS[@]}" -eq 0 ] && fail "No active PostgreSQL clusters found"
+
+echo
+echo "💾 Starting PostgreSQL backup"
+echo "-----------------------------"
+echo "pgBackRest repo : $REPO_PATH"
+echo
+
+for cluster in "${CLUSTERS[@]}"; do
+  echo "→ Backing up cluster: $cluster"
+  sudo -u postgres pgbackrest --stanza="$cluster" backup
+done
+
+echo
+echo "✅ Active clusters backed up successfully"
+
+# ---------------- EXPORT ----------------
+if [ -n "$EXPORT_PATH" ]; then
+  validate_export_path "$EXPORT_PATH"
+
+  DEST="$EXPORT_PATH/pgbackrest"
+
+  if [ "$(realpath "$REPO_PATH")" = "$(realpath "$DEST")" ]; then
+    echo
+    echo "ℹ️  Export skipped (repo already stored at destination)"
+    echo
+  else
+    echo
+    echo "📦 Exporting pgBackRest repository"
+    echo "---------------------------------"
+    echo "Source      : $REPO_PATH"
+    echo "Destination : $DEST"
+    echo
+
+    sudo rsync -a --delete \
+      "$REPO_PATH/" \
+      "$DEST/"
+
+    echo "✅ Backup exported successfully"
+  fi
+fi
+
+echo
+echo "🎉 pgbackup completed safely"
+echo
